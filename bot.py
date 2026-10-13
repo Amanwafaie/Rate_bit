@@ -19,10 +19,10 @@ def run_flask():
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-# اگر خواستید فقط خودتان بتوانید /postnow بزنید، آیدی عددی خود را در Render با نام ADMIN_ID بگذارید
+# اختیاری: آیدی عددی خودتان را در Render با نام ADMIN_ID بگذارید
 ADMIN_ID = os.getenv("ADMIN_ID")
 
-# ترجمه فارسی: (کلمه کلیدی انگلیسی، نام فارسی، پرچم)
+# (کلمه کلیدی انگلیسی، نام فارسی، پرچم)
 NAMES = [
     ("USD", "دالر امریکا", "🇺🇸"),
     ("EURO", "یورو", "🇪🇺"),
@@ -62,14 +62,16 @@ async def fetch_dab_rates():
                 cols = row.find_all("td")
                 if len(cols) < 2:
                     continue
-                fa, flag = translate(cols[0].get_text(strip=True))
+                raw_name = cols[0].get_text(strip=True)
+                fa, flag = translate(raw_name)
                 if not fa:
                     continue
                 try:
                     value = float(cols[1].get_text(strip=True).replace(",", ""))
                 except ValueError:
                     continue
-                if "INDIAN" in cols[0].get_text().upper() or "PAKISTAN" in cols[0].get_text().upper():
+                up = raw_name.upper()
+                if "INDIAN" in up or "PAKISTAN" in up:
                     text += f"{flag} {fa} (100): ؋ {value * 100:.2f}\n"
                 else:
                     text += f"{flag} {fa}: ؋ {value:.2f}\n"
@@ -101,12 +103,18 @@ async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         ok = await send_rates(context.bot)
-        await update.message.reply_text("✅ نرخ‌ها به کانال ارسال شد." if ok else "❌ دریافت نرخ ناموفق بود.")
+        if ok:
+            await update.message.reply_text("✅ نرخ جدید ارسال شد")
+        else:
+            await update.message.reply_text("❌ دریافت نرخ ناموفق بود")
     except Exception as e:
         await update.message.reply_text(f"❌ خطا: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"سلام! آیدی عددی شما: {update.effective_user.id}\nبرای ارسال فوری نرخ: /postnow")
+    await update.message.reply_text(
+        f"سلام! آیدی عددی شما: {update.effective_user.id}\n"
+        "برای ارسال فوری نرخ به کانال: /postnow"
+    )
 
 def main():
     if not BOT_TOKEN:
