@@ -4,7 +4,7 @@ import httpx
 from bs4 import BeautifulSoup
 from flask import Flask
 from datetime import datetime, timedelta, timezone
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 app_web = Flask(__name__)
@@ -19,10 +19,29 @@ def run_flask():
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-# اختیاری: آیدی عددی خودتان را در Render با نام ADMIN_ID بگذارید
 ADMIN_ID = os.getenv("ADMIN_ID")
 
-# (کلمه کلیدی انگلیسی، نام فارسی، پرچم)
+CHANNEL_USERNAME = "@NewsAfghan24"
+CHANNEL_LINK = "https://t.me/NewsAfghan24"
+
+FOOTER = (
+    "\n━━━━━━━━━━━━━━\n"
+    "ℹ️ نرخ مرجع رسمی است و ممکن است با بازار آزاد فرق داشته باشد.\n"
+    "🔄 به‌روزرسانی: هر ۲ ساعت\n\n"
+    f"📢 {CHANNEL_USERNAME}\n"
+    "🤝 کانال را به دوستان خود معرفی کنید"
+)
+
+SHARE_URL = (
+    "https://t.me/share/url?url=" + CHANNEL_LINK +
+    "&text=" + "نرخ روزانه ارز د افغانستان بانک"
+)
+
+def share_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📤 اشتراک‌گذاری کانال", url=SHARE_URL)
+    ]])
+
 NAMES = [
     ("USD", "دالر امریکا", "🇺🇸"),
     ("EURO", "یورو", "🇪🇺"),
@@ -78,7 +97,7 @@ async def fetch_dab_rates():
                 count += 1
             if count == 0:
                 return None
-            text += "\nℹ️ این نرخ‌ها مرجع رسمی است و ممکن است با نرخ بازار آزاد فرق داشته باشد."
+            text += FOOTER
             return text
     except Exception as e:
         print(f"Error scraping DAB: {e}")
@@ -89,7 +108,11 @@ async def send_rates(bot):
     if not text:
         print("No rates fetched")
         return False
-    await bot.send_message(chat_id=CHANNEL_ID, text=text)
+    await bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=text,
+        reply_markup=share_keyboard(),
+    )
     return True
 
 async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
