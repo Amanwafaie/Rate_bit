@@ -3,9 +3,10 @@ import threading
 import httpx
 from bs4 import BeautifulSoup
 from flask import Flask
-from telegram.ext import ApplicationBuilder, ContextTypes
+from datetime import datetime, timedelta, timezone
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ایجاد وب‌سرور برای زنده نگه داشتن سرویس روی Render
 app_web = Flask(__name__)
 
 @app_web.route('/')
@@ -16,63 +17,107 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app_web.run(host="0.0.0.0", port=port)
 
-# اطلاعات ربات و کانال
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+# اگر خواستید فقط خودتان بتوانید /postnow بزنید، آیدی عددی خود را در Render با نام ADMIN_ID بگذارید
+ADMIN_ID = os.getenv("ADMIN_ID")
+
+# ترجمه فارسی: (کلمه کلیدی انگلیسی، نام فارسی، پرچم)
+NAMES = [
+    ("USD", "دالر امریکا", "🇺🇸"),
+    ("EURO", "یورو", "🇪🇺"),
+    ("POUND", "پوند", "🇬🇧"),
+    ("SWISS", "فرانک سویس", "🇨🇭"),
+    ("INDIAN", "روپیه هند", "🇮🇳"),
+    ("PAKISTAN", "روپیه پاکستان", "🇵🇰"),
+    ("CNY", "یوان چین", "🇨🇳"),
+    ("UAE", "درهم امارات", "🇦🇪"),
+    ("SAUDI", "ریال سعودی", "🇸🇦"),
+]
+
+def translate(name):
+    up = name.upper()
+    for key, fa, flag in NAMES:
+        if key in up:
+            return fa, flag
+    return None, None
 
 async def fetch_dab_rates():
-    """تابع برای دریافت نرخ ارز از سایت د افغانستان بانک"""
     url = "https://dab.gov.af/exchange-rates"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, timeout=15)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                # استخراج اطلاعات نرخ ارز بر اساس ساختار سایت
-                rates_text = "📊 **آخرین نرخ ارزهای د افغانستان بانک (DAB)**\n\n"
-                
-                # پیدا کردن جدول نرخ‌ها در صفحه
-                tables = soup.find_all('table')
-                if tables:
-                    rows = tables[0].find_all('tr')
-                    for row in rows[1:]: # رد کردن ردیف سرتیتر
-                        cols = row.find_all('td')
-                        if len(cols) >= 2:
-                            currency = cols[0].get_text(strip=True)
-                            rate = cols[1].get_text(strip=True)
-                            rates_text += f"🔹 {currency}: `{rate}`\n"
-                    return rates_text
+            response = await client.get(url, headers=headers, timeout=20)
+            if response.status_code != 200:
+                return None
+            soup = BeautifulSoup(response.text, "html.parser")
+            tables = soup.find_all("table")
+            if not tables:
+                return None
+            kabul = timezone(timedelta(hours=4, minutes=30))
+            now = datetime.now(kabul).strftime("%Y-%m-%d  %H:%M")
+            text = f"💱 نرخ ارز | نرخ مرجع د افغانستان بانک\n🕐 {now}\n\n"
+            count = 0
+            for row in tables[0].find_all("tr")[1:]:
+                cols = row.find_all("td")
+                if len(cols) < 2:
+                    continue
+                fa, flag = translate(cols[0].get_text(strip=True))
+                if not fa:
+                    continue
+                try:
+                    value = float(cols[1].get_text(strip=True).replace(",", ""))
+                except ValueError:
+                    continue
+                if "INDIAN" in cols[0].get_text().upper() or "PAKISTAN" in cols[0].get_text().upper():
+                    text += f"{flag} {fa} (100): ؋ {value * 100:.2f}\n"
                 else:
-                    return "📊 آخرین نرخ ارزها: اطلاعات جدول در سایت یافت نشد، اما اتصال برقرار است."
+                    text += f"{flag} {fa}: ؋ {value:.2f}\n"
+                count += 1
+            if count == 0:
+                return None
+            text += "\nℹ️ این نرخ‌ها مرجع رسمی است و ممکن است با نرخ بازار آزاد فرق داشته باشد."
+            return text
     except Exception as e:
         print(f"Error scraping DAB: {e}")
     return None
 
-async def fetch_and_post(context: ContextTypes.DEFAULT_TYPE):
-    """تایمر خودکار برای ارسال پیام هر ۲ ساعت"""
+async def send_rates(bot):
     text = await fetch_dab_rates()
-    if text and CHANNEL_ID:
-        try:
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="Markdown")
-        except Exception as e:
-            print(f"Error sending message to channel: {e}")
+    if not text:
+        print("No rates fetched")
+        return False
+    await bot.send_message(chat_id=CHANNEL_ID, text=text)
+    return True
+
+async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await send_rates(context.bot)
+    except Exception as e:
+        print(f"Error sending message: {e}")
+
+async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_ID and str(update.effective_user.id) != str(ADMIN_ID):
+        return
+    try:
+        ok = await send_rates(context.bot)
+        await update.message.reply_text("✅ نرخ‌ها به کانال ارسال شد." if ok else "❌ دریافت نرخ ناموفق بود.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا: {e}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"سلام! آیدی عددی شما: {update.effective_user.id}\nبرای ارسال فوری نرخ: /postnow")
 
 def main():
     if not BOT_TOKEN:
         print("Error: BOT_TOKEN is missing!")
         return
-
-    # استارت کردن وب‌سرور در پس‌زمینه
     threading.Thread(target=run_flask, daemon=True).start()
-
-    # ساخت اپلیکیشن تلگرام
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # تنظیم زمان‌بندی (هر ۷۲۰۰ ثانیه = ۲ ساعت، و شروع اولین اجرا بعد از ۵ ثانیه)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("postnow", postnow))
     if app.job_queue:
-        app.job_queue.run_repeating(fetch_and_post, interval=7200, first=5)
-
+        app.job_queue.run_repeating(scheduled_post, interval=7200, first=10)
     app.run_polling()
 
 if __name__ == "__main__":
