@@ -82,6 +82,20 @@ def translate(name):
             return fa, flag
     return None, None
 
+# نرخ‌های دفعه قبل (برای نشان دادن فلش)
+LAST_RATES = {}
+
+def arrow(key, value):
+    old = LAST_RATES.get(key)
+    LAST_RATES[key] = value
+    if old is None:
+        return ""
+    if value > old + 0.004:
+        return " 🔺"
+    if value < old - 0.004:
+        return " 🔻"
+    return " ➖"
+
 async def fetch_dab_rates():
     url = "https://dab.gov.af/exchange-rates"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -96,6 +110,7 @@ async def fetch_dab_rates():
                 return None
             text = f"💱 نرخ ارز | نرخ مرجع د افغانستان بانک\n🕐 {now_kabul()}\n\n"
             count = 0
+            new_rates = {}
             for row in tables[0].find_all("tr")[1:]:
                 cols = row.find_all("td")
                 if len(cols) < 2:
@@ -110,12 +125,16 @@ async def fetch_dab_rates():
                     continue
                 up = raw_name.upper()
                 if "INDIAN" in up or "PAKISTAN" in up:
-                    text += f"{flag} {fa} (100): ؋ {value * 100:.2f}\n"
+                    value = value * 100
+                    label = f"{fa} (100)"
                 else:
-                    text += f"{flag} {fa}: ؋ {value:.2f}\n"
+                    label = fa
+                new_rates[fa] = value
+                text += f"{flag} {label}: ؋ {value:.2f}{arrow(fa, value)}\n"
                 count += 1
             if count == 0:
                 return None
+            text += "\n🔺 بالا رفته   🔻 پایین آمده   ➖ بدون تغییر"
             return text + footer("نرخ مرجع رسمی است و ممکن است با بازار آزاد فرق داشته باشد.")
     except Exception as e:
         print(f"Error scraping DAB: {e}")
