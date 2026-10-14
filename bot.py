@@ -154,6 +154,9 @@ async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
         print(f"Error sending message: {e}")
 
 # ================= کانال ۳: طلا و ارز دیجیتال =================
+GOLD_ERRORS = []
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
 def fmt_change(c):
     if c is None:
         return ""
@@ -165,54 +168,83 @@ def fmt_change(c):
         icon = "➖"
     return f"  {icon} {c:+.2f}%"
 
-async def fetch_gold_crypto():
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": "bitcoin,ethereum,tether,pax-gold",
-        "vs_currencies": "usd",
-        "include_24hr_change": "true",
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        if r.status_code != 200:
-            print(f"CoinGecko status {r.status_code}")
-            return None
-        data = r.json()
-    except Exception as e:
-        print(f"Error fetching gold/crypto: {e}")
-        return None
-
-    def get(key):
+async def from_coingecko(client):
+    r = await client.get(
+        "https://api.coingecko.com/api/v3/simple/price",
+        params={
+            "ids": "bitcoin,ethereum,tether,pax-gold",
+            "vs_currencies": "usd",
+            "include_24hr_change": "true",
+        },
+        headers=HTTP_HEADERS,
+        timeout=20,
+    )
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code}")
+    data = r.json()
+    out = {}
+    for key, name in [("pax-gold", "gold"), ("bitcoin", "btc"), ("ethereum", "eth"), ("tether", "usdt")]:
         item = data.get(key) or {}
-        return item.get("usd"), item.get("usd_24h_change")
+        if item.get("usd"):
+            out[name] = (item["usd"], item.get("usd_24h_change"))
+    if not out:
+        raise Exception("empty response: " + r.text[:100])
+    return out
+
+async def from_kraken(client):
+    out = {}
+    for pair, name in [("PAXGUSD", "gold"), ("XBTUSD", "btc"), ("ETHUSD", "eth"), ("USDTUSD", "usdt")]:
+        try:
+            r = await client.get(
+                "https://api.kraken.com/0/public/Ticker",
+                params={"pair": pair},
+                headers=HTTP_HEADERS,
+                timeout=20,
+            )
+            if r.status_code != 200:
+                raise Exception(f"HTTP {r.status_code}")
+            j = r.json()
+            if j.get("error"):
+                raise Exception(str(j["error"])[:80])
+            ticker = list(j["result"].values())[0]
+            last = float(ticker["c"][0])
+            opened = float(ticker["o"])
+            change = (last - opened) / opened * 100 if opened else None
+            out[name] = (last, change)
+        except Exception as e:
+            GOLD_ERRORS.append(f"Kraken {pair}: {e}")
+    if not out:
+        raise Exception("no data")
+    return out
+
+async def fetch_gold_crypto():
+    GOLD_ERRORS.clear()
+    data = None
+    async with httpx.AsyncClient() as client:
+        for name, fn in (("CoinGecko", from_coingecko), ("Kraken", from_kraken)):
+            try:
+                data = await fn(client)
+                break
+            except Exception as e:
+                GOLD_ERRORS.append(f"{name}: {e}")
+    if not data:
+        print("Gold/crypto errors: " + " | ".join(GOLD_ERRORS))
+        return None
 
     text = f"🪙 قیمت لحظه‌ای طلا و ارز دیجیتال\n🕐 {now_kabul()}\n\n"
-    count = 0
-
-    gold, gold_ch = get("pax-gold")
-    if gold:
-        text += f"🥇 طلا (هر اونس): $ {gold:,.2f}{fmt_change(gold_ch)}\n"
-        text += f"🥇 طلا (هر گرام): $ {gold / 31.1035:,.2f}\n\n"
-        count += 1
-
-    btc, btc_ch = get("bitcoin")
-    if btc:
-        text += f"₿ بیت‌کوین: $ {btc:,.0f}{fmt_change(btc_ch)}\n"
-        count += 1
-
-    eth, eth_ch = get("ethereum")
-    if eth:
-        text += f"💎 اتریوم: $ {eth:,.2f}{fmt_change(eth_ch)}\n"
-        count += 1
-
-    usdt, usdt_ch = get("tether")
-    if usdt:
-        text += f"💲 تتر (USDT): $ {usdt:.4f}{fmt_change(usdt_ch)}\n"
-        count += 1
-
-    if count == 0:
-        return None
+    if "gold" in data:
+        price, ch = data["gold"]
+        text += f"🥇 طلا (هر اونس): $ {price:,.2f}{fmt_change(ch)}\n"
+        text += f"🥇 طلا (هر گرام): $ {price / 31.1035:,.2f}\n\n"
+    if "btc" in data:
+        price, ch = data["btc"]
+        text += f"₿ بیت‌کوین: $ {price:,.0f}{fmt_change(ch)}\n"
+    if "eth" in data:
+        price, ch = data["eth"]
+        text += f"💎 اتریوم: $ {price:,.2f}{fmt_change(ch)}\n"
+    if "usdt" in data:
+        price, ch = data["usdt"]
+        text += f"💲 تتر (USDT): $ {price:.4f}{fmt_change(ch)}\n"
     text += "\n🔺 بالا رفته   🔻 پایین آمده   ➖ بدون تغییر (۲۴ ساعت)"
     return text + footer(
         "قیمت طلا بر اساس توکن طلای PAXG (معادل یک اونس طلا) است و ممکن است با قیمت بازار کمی فرق داشته باشد.",
@@ -242,9 +274,10 @@ async def gold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif result == "no_channel":
             await update.message.reply_text("⚠️ متغیر CHANNEL_GOLD در Render تنظیم نشده است")
         else:
-            await update.message.reply_text("❌ دریافت قیمت ناموفق بود")
+            reasons = "\n".join(GOLD_ERRORS)[:900]
+            await update.message.reply_text("❌ دریافت قیمت ناموفق بود\n\nدلیل:\n" + reasons)
     except Exception as e:
-        await update.message.reply_text(f"❌ خطا: {e}")
+        await update.message.reply_text(f"❌ خطا در ارسال به کانال: {e}")
 
 # ================= نرخ بازار دستی =================
 DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩٫٬،", "01234567890123456789.. ")
