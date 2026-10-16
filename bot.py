@@ -595,6 +595,7 @@ PREFERRED = ["llama-3.3-70b", "gemma-3-27b", "qwen3", "qwen-2.5-72b", "deepseek"
              "mistral", "gpt-oss", "llama", "gemma"]
 
 
+COOLDOWN = {}        # مدل -> تا چه زمانی استراحت کند
 BAD_MODELS = set()   # مدل‌هایی که خطای دائمی دادند
 
 
@@ -617,7 +618,7 @@ async def ai_models(client):
         free.append((score, -int(m.get("context_length") or 0), mid))
     free.sort()
     own = [m.strip() for m in OPENROUTER_MODEL.split(",") if m.strip() and m.strip() not in BAD_MODELS]
-    AI["models"] = own + [x[2] for x in free[:12] if x[2] not in own]
+    AI["models"] = own + [x[2] for x in free[:20] if x[2] not in own]
     AI["ts"] = time.time()
     return AI["models"]
 
@@ -677,9 +678,9 @@ async def ai_enrich(item):
             tried = 0
             errs = errs_all
             for model in models:
-                if model in BAD_MODELS:
+                if model in BAD_MODELS or COOLDOWN.get(model, 0) > time.time():
                     continue
-                if tried >= 5:
+                if tried >= 8:
                     break
                 tried += 1
                 AI["calls"] += 1
@@ -695,11 +696,19 @@ async def ai_enrich(item):
                     if r.status_code != 200:
                         AI["last_error"] = f"{model}: HTTP {r.status_code} {r.text[:150]}"
                         errs.append(AI["last_error"][:90])
+                        if r.status_code == 429:
+                            COOLDOWN[model] = time.time() + 600
                         if r.status_code in (400, 402, 403, 404):
                             BAD_MODELS.add(model)
                             AI["models"] = [x for x in AI["models"] if x != model]
                         continue
-                    content = r.json()["choices"][0]["message"]["content"]
+                    msg = (r.json().get("choices") or [{}])[0].get("message") or {}
+                    content = msg.get("content") or ""
+                    if not content.strip():
+                        AI["last_error"] = f"{model}: empty answer"
+                        errs.append(AI["last_error"])
+                        COOLDOWN[model] = time.time() + 1800
+                        continue
                     obj = extract_json(content)
                     if not str(obj.get("title_fa", "")).strip() or not str(obj.get("summary_fa", "")).strip():
                         AI["last_error"] = f"{model}: incomplete answer"
