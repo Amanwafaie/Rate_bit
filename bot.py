@@ -595,6 +595,9 @@ PREFERRED = ["llama-3.3-70b", "gemma-3-27b", "qwen3", "qwen-2.5-72b", "deepseek"
              "mistral", "gpt-oss", "llama", "gemma"]
 
 
+BAD_MODELS = set()   # مدل‌هایی که خطای دائمی دادند
+
+
 async def ai_models(client):
     if OPENROUTER_MODEL:
         return [m.strip() for m in OPENROUTER_MODEL.split(",") if m.strip()]
@@ -611,9 +614,11 @@ async def ai_models(client):
         if any(w in low for w in BAD_MODEL_WORDS):
             continue
         score = next((i for i, p in enumerate(PREFERRED) if p in low), 99)
+        if mid in BAD_MODELS:
+            continue
         free.append((score, -int(m.get("context_length") or 0), mid))
     free.sort()
-    AI["models"] = [x[2] for x in free[:5]]
+    AI["models"] = [x[2] for x in free[:12]]
     AI["ts"] = time.time()
     return AI["models"]
 
@@ -669,7 +674,13 @@ async def ai_enrich(item):
             if not models:
                 AI["last_error"] = "no free model found"
                 return None
-            for model in models[:3]:
+            tried = 0
+            for model in models:
+                if model in BAD_MODELS:
+                    continue
+                if tried >= 5:
+                    break
+                tried += 1
                 AI["calls"] += 1
                 try:
                     r = await client.post(
@@ -682,6 +693,9 @@ async def ai_enrich(item):
                     )
                     if r.status_code != 200:
                         AI["last_error"] = f"{model}: HTTP {r.status_code} {r.text[:150]}"
+                        if r.status_code in (400, 402, 403, 404):
+                            BAD_MODELS.add(model)
+                            AI["models"] = [x for x in AI["models"] if x != model]
                         continue
                     content = r.json()["choices"][0]["message"]["content"]
                     obj = extract_json(content)
