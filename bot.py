@@ -713,6 +713,9 @@ async def ai_enrich(item):
                     return obj
                 except Exception as e:
                     AI["last_error"] = f"{model}: {type(e).__name__} {str(e)[:100]}"
+                    if "Timeout" in type(e).__name__:
+                        BAD_MODELS.add(model)       # مدل کند: دیگر امتحان نشود
+                        AI["models"] = [x for x in AI["models"] if x != model]
                     errs.append(AI["last_error"][:90])
     except Exception as e:
         AI["last_error"] = f"{type(e).__name__} {str(e)[:100]}"
