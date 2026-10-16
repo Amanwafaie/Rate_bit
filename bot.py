@@ -599,8 +599,6 @@ BAD_MODELS = set()   # مدل‌هایی که خطای دائمی دادند
 
 
 async def ai_models(client):
-    if OPENROUTER_MODEL:
-        return [m.strip() for m in OPENROUTER_MODEL.split(",") if m.strip()]
     if AI["models"] and time.time() - AI["ts"] < 6 * 3600:
         return AI["models"]
     r = await client.get("https://openrouter.ai/api/v1/models", timeout=30)
@@ -618,7 +616,8 @@ async def ai_models(client):
             continue
         free.append((score, -int(m.get("context_length") or 0), mid))
     free.sort()
-    AI["models"] = [x[2] for x in free[:12]]
+    own = [m.strip() for m in OPENROUTER_MODEL.split(",") if m.strip() and m.strip() not in BAD_MODELS]
+    AI["models"] = own + [x[2] for x in free[:12] if x[2] not in own]
     AI["ts"] = time.time()
     return AI["models"]
 
