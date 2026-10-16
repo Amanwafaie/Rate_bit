@@ -590,7 +590,7 @@ async def get_items(src, force_refresh=False):
 #  هوش مصنوعی (OpenRouter، مدل رایگان)
 # =====================================================================
 AI = {"models": [], "ts": 0, "calls": 0, "day": None, "last_error": ""}
-BAD_MODEL_WORDS = ("vl", "coder", "image", "guard", "embed", "vision", "audio", "whisper")
+BAD_MODEL_WORDS = ("vl", "coder", "image", "guard", "embed", "vision", "audio", "whisper", "ultra", "550b", "405b", "inkling", "thinkingmachines", "thinking", "reasoner", "-r1")
 PREFERRED = ["llama-3.3-70b", "gemma-3-27b", "qwen3", "qwen-2.5-72b", "deepseek",
              "mistral", "gpt-oss", "llama", "gemma"]
 
@@ -667,6 +667,7 @@ async def ai_enrich(item):
         "Return JSON only, with no markdown.\n\n"
         f"Title: {item['title']}\nText: {item['desc'][:1200]}"
     )
+    errs_all = []
     try:
         async with make_client() as client:
             models = await ai_models(client)
@@ -674,6 +675,7 @@ async def ai_enrich(item):
                 AI["last_error"] = "no free model found"
                 return None
             tried = 0
+            errs = errs_all
             for model in models:
                 if model in BAD_MODELS:
                     continue
@@ -688,10 +690,11 @@ async def ai_enrich(item):
                                  "X-Title": "NabzKhabar"},
                         json={"model": model, "temperature": 0.3, "max_tokens": 700,
                               "messages": [{"role": "user", "content": prompt}]},
-                        timeout=90,
+                        timeout=45,
                     )
                     if r.status_code != 200:
                         AI["last_error"] = f"{model}: HTTP {r.status_code} {r.text[:150]}"
+                        errs.append(AI["last_error"][:90])
                         if r.status_code in (400, 402, 403, 404):
                             BAD_MODELS.add(model)
                             AI["models"] = [x for x in AI["models"] if x != model]
@@ -700,16 +703,21 @@ async def ai_enrich(item):
                     obj = extract_json(content)
                     if not str(obj.get("title_fa", "")).strip() or not str(obj.get("summary_fa", "")).strip():
                         AI["last_error"] = f"{model}: incomplete answer"
+                        errs.append(AI["last_error"])
                         continue
                     if persian_ratio(str(obj["title_fa"]) + " " + str(obj["summary_fa"])) < 0.5:
                         AI["last_error"] = f"{model}: answer was not Persian"
+                        errs.append(AI["last_error"])
                         continue
                     AI["last_error"] = ""
                     return obj
                 except Exception as e:
                     AI["last_error"] = f"{model}: {type(e).__name__} {str(e)[:100]}"
+                    errs.append(AI["last_error"][:90])
     except Exception as e:
         AI["last_error"] = f"{type(e).__name__} {str(e)[:100]}"
+    if errs_all:
+        AI["last_error"] = " | ".join(errs_all)
     return None
 
 
