@@ -668,28 +668,52 @@ def check_obj(obj):
     return ""
 
 
-GROQ_MODELS = ("llama-3.3-70b-versatile", "llama-3.1-8b-instant")
+GROQ = {"models": [], "ts": 0, "bad": set(), "used": ""}
+GROQ_SKIP = ("whisper", "guard", "tts", "orpheus", "playai", "embed", "safeguard", "moderation")
+GROQ_PREFER = ("llama-3.3-70b", "gpt-oss-120b", "qwen", "llama-4", "kimi", "llama-3.1-70b",
+               "gpt-oss-20b", "llama-3.1-8b", "gemma")
+
+
+async def groq_models(client):
+    if GROQ["models"] and time.time() - GROQ["ts"] < 6 * 3600:
+        return [m for m in GROQ["models"] if m not in GROQ["bad"]]
+    r = await client.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"model list HTTP {r.status_code} {r.text[:80]}")
+    ids = [str(m.get("id", "")) for m in r.json().get("data", []) if m.get("active", True)]
+    ids = [i for i in ids if i and not any(w in i.lower() for w in GROQ_SKIP)]
+    ids.sort(key=lambda i: next((n for n, p in enumerate(GROQ_PREFER) if p in i.lower()), 99))
+    GROQ["models"], GROQ["ts"] = ids, time.time()
+    return [m for m in ids if m not in GROQ["bad"]]
 
 
 async def groq_call(prompt, max_tokens, errs):
-    """ارائه‌دهنده‌ی دوم (Groq)، فقط اگر کلیدش در Render گذاشته شده باشد."""
+    """ارائه‌ی دهنده‌ی دوم (Groq)، فقط اگر کلیدش در Render گذاشته شده باشد."""
     if not GROQ_API_KEY:
         return None
     try:
         async with make_client() as client:
-            for model in GROQ_MODELS:
+            try:
+                models = await asyncio.wait_for(groq_models(client), 25)
+            except Exception as e:
+                errs.append(f"groq model list: {type(e).__name__} {str(e)[:80]}")
+                return None
+            print(f"[ai] groq models: {', '.join(models[:5])}", flush=True)
+            for model in models[:3]:
                 print(f"[ai] trying groq {model}", flush=True)
                 try:
                     r = await asyncio.wait_for(client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                         json={"model": model, "temperature": 0.3, "max_tokens": max_tokens,
-                              "response_format": {"type": "json_object"},
                               "messages": [{"role": "user", "content": prompt}]},
                         timeout=30), 35)
                     print(f"[ai] groq {model} -> HTTP {r.status_code}", flush=True)
                     if r.status_code != 200:
-                        errs.append(f"groq/{model}: HTTP {r.status_code} {r.text[:60]}")
+                        errs.append(f"groq/{model}: HTTP {r.status_code} {r.text[:70]}")
+                        if r.status_code in (400, 403, 404):
+                            GROQ["bad"].add(model)
                         continue
                     content = (((r.json().get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
                     obj = extract_json(content)
@@ -697,6 +721,7 @@ async def groq_call(prompt, max_tokens, errs):
                     if bad:
                         errs.append(f"groq/{model}: {bad}")
                         continue
+                    GROQ["used"] = model
                     return obj
                 except Exception as e:
                     errs.append(f"groq/{model}: {type(e).__name__} {str(e)[:60]}")
@@ -708,6 +733,7 @@ async def groq_call(prompt, max_tokens, errs):
 async def ai_call(prompt, admin=False, max_tokens=1200, budget=None, _retry=False):
     """یک درخواست به مدل‌های رایگان؛ جواب JSON برمی‌گرداند یا None."""
     pre_errs = []
+    GROQ["used"] = "" if not _retry else GROQ["used"]
     if GROQ_API_KEY and not _retry:
         obj = await groq_call(prompt, max_tokens, pre_errs)
         if obj:
@@ -1605,7 +1631,7 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if res:
         await update.message.reply_text(
             "✅ کار می‌کند\n\n" + str(res.get("title_fa")) + "\n" + str(res.get("summary_fa")) +
-            "\n\nمدل‌ها: " + ", ".join(AI["models"][:3]) + f"\nمصرف امروز: {AI['calls']}/{AI_DAILY_LIMIT}")
+            "\n\nارائه‌دهنده: " + (("Groq / " + GROQ["used"]) if GROQ["used"] and GROQ_API_KEY else "OpenRouter") + "\nمدل‌های OpenRouter: " + ", ".join(AI["models"][:3]) + f"\nمصرف امروز: {AI['calls']}/{AI_DAILY_LIMIT}")
     else:
         await update.message.reply_text("❌ کار نکرد\nدلیل: " + (AI["last_error"] or "-"))
 
