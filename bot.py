@@ -41,6 +41,7 @@ ADMINS = [a.strip() for a in os.getenv("ADMIN_ID", "").split(",") if a.strip()]
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "")  # اختیاری
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")          # اختیاری: ارائه‌دهنده‌ی دوم هوش مصنوعی (رایگان)
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
@@ -654,17 +655,73 @@ def ai_reset_day():
         AI["calls"] = 0
 
 
+def check_obj(obj):
+    """پاسخ هوش مصنوعی را بررسی می‌کند؛ اگر مشکل داشت متن خطا برمی‌گرداند، وگرنه ''."""
+    if not str(obj.get("title_fa", "")).strip() or not str(obj.get("summary_fa", "")).strip():
+        return "incomplete answer"
+    if persian_ratio(str(obj["title_fa"]) + " " + str(obj["summary_fa"])) < 0.5:
+        return "answer was not Persian"
+    mixed = str(obj.get("title_fa", "")) + " " + str(obj.get("summary_fa", "")) + " " + \
+        str(obj.get("analysis_fa", "")) + " " + " ".join(str(b) for b in (obj.get("bullets_fa") or []))
+    if re.search(r"\b[a-z]{3,}\b", mixed):
+        return "English words mixed in"
+    return ""
+
+
+GROQ_MODELS = ("llama-3.3-70b-versatile", "llama-3.1-8b-instant")
+
+
+async def groq_call(prompt, max_tokens, errs):
+    """ارائه‌دهنده‌ی دوم (Groq)، فقط اگر کلیدش در Render گذاشته شده باشد."""
+    if not GROQ_API_KEY:
+        return None
+    try:
+        async with make_client() as client:
+            for model in GROQ_MODELS:
+                print(f"[ai] trying groq {model}", flush=True)
+                try:
+                    r = await asyncio.wait_for(client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        json={"model": model, "temperature": 0.3, "max_tokens": max_tokens,
+                              "response_format": {"type": "json_object"},
+                              "messages": [{"role": "user", "content": prompt}]},
+                        timeout=30), 35)
+                    print(f"[ai] groq {model} -> HTTP {r.status_code}", flush=True)
+                    if r.status_code != 200:
+                        errs.append(f"groq/{model}: HTTP {r.status_code} {r.text[:60]}")
+                        continue
+                    content = (((r.json().get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+                    obj = extract_json(content)
+                    bad = check_obj(obj)
+                    if bad:
+                        errs.append(f"groq/{model}: {bad}")
+                        continue
+                    return obj
+                except Exception as e:
+                    errs.append(f"groq/{model}: {type(e).__name__} {str(e)[:60]}")
+    except Exception as e:
+        errs.append(f"groq: {type(e).__name__}")
+    return None
+
+
 async def ai_call(prompt, admin=False, max_tokens=1200, budget=None, _retry=False):
     """یک درخواست به مدل‌های رایگان؛ جواب JSON برمی‌گرداند یا None."""
+    pre_errs = []
+    if GROQ_API_KEY and not _retry:
+        obj = await groq_call(prompt, max_tokens, pre_errs)
+        if obj:
+            AI["last_error"] = ""
+            return obj
     if not OPENROUTER_API_KEY:
-        AI["last_error"] = "OPENROUTER_API_KEY not set"
+        AI["last_error"] = " | ".join(pre_errs) or "OPENROUTER_API_KEY not set"
         return None
     ai_reset_day()
     limit = AI_DAILY_LIMIT if admin else AI_DAILY_LIMIT - AI_ADMIN_RESERVE
     if AI["calls"] >= limit:
         AI["last_error"] = "daily limit reached"
         return None
-    errs = []
+    errs = list(pre_errs)
     deadline = time.time() + budget if budget else None
     try:
         async with make_client() as client:
@@ -1315,12 +1372,9 @@ async def smart_news(update, context, text):
     ai = await compose_from_search(query, res)
     print(f"[smart] ai done: {'ok' if ai else 'FAILED ' + (AI['last_error'] or '')[:200]}", flush=True)
     if not ai:
-        top = res["results"][0]
         answer = tidy(res.get("answer", ""))
-        snippet = answer if persian_ratio(answer) >= 0.5 and len(answer) > 40 else tidy(str(top.get("content", "")))
-        title = tidy(str(top.get("title", "")))
-        if persian_ratio(title + " " + snippet) >= 0.5:
-            # هوش مصنوعی در دسترس نیست ولی خود منبع فارسی است: پیش‌نویس بدون هوش مصنوعی
+        if persian_ratio(answer) >= 0.5 and len(answer) > 60:
+            # هوش مصنوعی ما در دسترس نیست ولی خود Tavily یک جواب فارسی داده؛ فقط به‌عنوان پیش‌نویس با هشدار
             names = []
             for x in res["results"][:3]:
                 n = src_name(x["url"])
@@ -1330,12 +1384,13 @@ async def smart_news(update, context, text):
             foot = "📌 منبع: " + "، ".join(esc(n) for n in names)
             if CHANNEL_ID and CHANNEL_ID.startswith("@"):
                 foot += f"\n📢 {CHANNEL_ID}"
-            text_out = f"📰 <b>{esc(short(title, 110))}</b>\n\n{esc(short(snippet, 480))}\n\n{foot}"
+            text_out = f"📰 <b>{esc(short(query, 110))}</b>\n\n{esc(short(answer, 600))}\n\n{foot}"
             photo, credit = await pick_photo(res, "")
             d = {
                 "text": text_out, "parse": "HTML", "photo": photo,
-                "note": "هوش مصنوعی الان جواب نداد، پس این متن بدون ویرایش از خود منبع اول برداشته شده است. "
-                        "قبل از ارسال حتماً بخوان. (" + (AI["last_error"] or "-")[:150] + ")",
+                "note": "⚠️ هوش مصنوعی ما جواب نداد؛ این متن خلاصه‌ی خودکار سرویس جست‌وجو است. "
+                        "عددها و تاریخ‌ها را حتماً با لینک‌ها تأیید کن، ممکن است قدیمی باشند. "
+                        "(" + (AI["last_error"] or "-")[:120] + ")",
                 "sources": [{"name": src_name(x["url"]), "url": unquote(x["url"]),
                              "date": str(x.get("published_date") or "")[:16]} for x in res["results"][:5]],
             }
@@ -1345,11 +1400,11 @@ async def smart_news(update, context, text):
                 pass
             await show_preview(update, context, d)
             return
-        lines = ["❌ هوش مصنوعی الان جواب نداد و منبع‌ها فارسی نبودند.",
+        lines = ["❌ هوش مصنوعی الان جواب نداد و من نمی‌خواهم متن خام و احتمالاً قدیمی را برایت پیش‌نویس کنم.",
                  "خطا: " + (AI["last_error"] or "-")[:300],
-                 "چند دقیقه بعد دوباره بپرس. منبع‌های پیداشده:"]
+                 "چند دقیقه بعد دوباره بپرس. منبع‌های پیداشده (برای بررسی خودت):"]
         for x in res["results"][:4]:
-            lines.append(f"• {src_name(x['url'])}")
+            lines.append(f"• {src_name(x['url'])}: {unquote(x['url'])[:90]}")
         await wait.edit_text("\n".join(lines))
         return
     entity = "" if ai.get("sensitive") else str(ai.get("entity_en") or "").strip()
