@@ -626,7 +626,8 @@ async def ai_models(client):
         free.append((score, -int(m.get("context_length") or 0), mid))
     free.sort()
     own = [m.strip() for m in OPENROUTER_MODEL.split(",") if m.strip() and m.strip() not in BAD_MODELS]
-    AI["models"] = own + [x[2] for x in free[:20] if x[2] not in own]
+    router = [m for m in ("openrouter/free",) if m not in BAD_MODELS]   # خود OpenRouter مدل آزاد را انتخاب می‌کند
+    AI["models"] = own + router + [x[2] for x in free[:20] if x[2] not in own]
     AI["ts"] = time.time()
     return AI["models"]
 
@@ -741,7 +742,7 @@ async def ai_call(prompt, admin=False, max_tokens=1200, budget=None, _retry=Fals
     return None
 
 
-async def ai_enrich(item):
+async def ai_enrich(item, admin=False):
     """ترجمه/خلاصه/تحلیل یک خبر برنامه‌ریزی‌شده. اگر نشد None برمی‌گرداند."""
     prompt = (
         "You are a careful news editor for a Persian (Dari/Farsi) Telegram news channel.\n"
@@ -757,7 +758,7 @@ async def ai_enrich(item):
         "Return JSON only, with no markdown.\n\n"
         f"Title: {item['title']}\nText: {item['desc'][:1200]}"
     )
-    return await ai_call(prompt, admin=False, max_tokens=1200)
+    return await ai_call(prompt, admin=admin, max_tokens=1200, budget=70 if admin else None)
 
 
 # =====================================================================
@@ -1046,7 +1047,8 @@ async def tavily_search(query, news=True, n=6):
         TAV["month"] = month
         TAV["calls"] = 0
     body = {"query": query[:380], "topic": "news" if news else "general",
-            "search_depth": "basic", "max_results": n, "include_images": True}
+            "search_depth": "basic", "max_results": n, "include_images": True,
+            "include_answer": True}
     if news:
         body["days"] = 3
     try:
@@ -1066,7 +1068,7 @@ async def tavily_search(query, news=True, n=6):
             if isinstance(u, str) and u.startswith("http"):
                 images.append(u)
         TAV["last_error"] = ""
-        return {"results": results, "images": images}
+        return {"results": results, "images": images, "answer": str(j.get("answer") or "")}
     except Exception as e:
         TAV["last_error"] = f"{type(e).__name__} {str(e)[:100]}"
         return None
@@ -1200,11 +1202,79 @@ async def show_preview(update, context, d):
                                        link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
+CAT_WORDS = {"افغانستان": "afg", "جهان": "world", "اقتصاد": "fin", "مالی": "fin",
+             "تکنولوژی": "tech", "فناوری": "tech", "ورزش": "sport"}
+GENERIC_WORDS = ("مهم‌ترین", "مهمترین", "مهم ترین", "آخرین", "تازه‌ترین", "تازه ترین",
+                 "خبر امروز", "خبر جدید", "یه خبر", "یک خبر")
+
+
+def rss_category(text):
+    """درخواست‌های کلی مثل «مهم‌ترین خبر امروز افغانستان» از منبع‌های خودمان جواب داده می‌شود."""
+    if not any(g in text for g in GENERIC_WORDS):
+        return None
+    if "درباره" in text or "در مورد" in text:
+        return None
+    cats = {c for w, c in CAT_WORDS.items() if w in text}
+    if len(cats) != 1 or len(clean_query(text).split()) > 9:
+        return None
+    return next(iter(cats))
+
+
+def tidy(s):
+    s = re.sub(r"[#*_>`]+", " ", s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"\s*[-–|]\s*(BBC.*|افغانستان اینترنشنال.*|رادیو.*|DW.*)$", "", s).strip()
+
+
+async def rss_draft(update, context, cat):
+    cands = await candidates_for(cat, force=True)
+    if not cands:
+        return False
+    for item in cands[:5]:
+        ai = await ai_enrich(item, admin=True)
+        if not ai and item["lang"] == "en":
+            continue                  # منبع انگلیسی بدون هوش مصنوعی قابل‌استفاده نیست
+        image = item.get("image") or await og_image(item["link"])
+        credit = ""
+        if not image and ai and not ai.get("sensitive") and str(ai.get("entity_en") or "").strip():
+            w = await wiki_image(str(ai["entity_en"]))
+            if w:
+                image, credit = re.sub(r"/\d+px-", "/800px-", w), "عکس: ویکی‌پدیا"
+        text = build_news_text(item, ai, credit=credit)
+        if len(text) > 1000 and ai:
+            ai2 = dict(ai)
+            ai2["analysis_fa"] = ""
+            text = build_news_text(item, ai2, credit=credit)
+        d = {
+            "text": text, "parse": "HTML", "photo": image, "mark": item["id"],
+            "sources": [{"name": item["source"], "url": item["link"],
+                         "date": item["pub"].astimezone(KABUL).strftime("%Y-%m-%d %H:%M")}],
+            "note": "" if ai else "هوش مصنوعی الان جواب نداد؛ متن از خود خبر برداشته شده (بدون تحلیل). بخوان و بعد بفرست.",
+        }
+        await show_preview(update, context, d)
+        return True
+    return False
+
+
 async def smart_news(update, context, text):
     print(f"[smart] start: {text[:60]}", flush=True)
     query = clean_query(text)
     news = any(w in text for w in NEWS_WORDS)
     wait = await update.message.reply_text("⏳ در حال جست‌وجو و آماده‌سازی...")
+    cat = rss_category(text)
+    if cat:
+        print(f"[smart] rss route: {cat}", flush=True)
+        try:
+            ok = await rss_draft(update, context, cat)
+        except Exception as e:
+            print(f"[smart] rss error: {e}", flush=True)
+            ok = False
+        if ok:
+            try:
+                await wait.delete()
+            except Exception:
+                pass
+            return
     res = await tavily_search(query, news=news)
     if news and (not res or len(res["results"]) < 2):
         res = await tavily_search(query, news=False) or res
@@ -1220,8 +1290,9 @@ async def smart_news(update, context, text):
     print(f"[smart] ai done: {'ok' if ai else 'FAILED ' + (AI['last_error'] or '')[:200]}", flush=True)
     if not ai:
         top = res["results"][0]
-        snippet = re.sub(r"\s+", " ", str(top.get("content", ""))).strip()
-        title = re.sub(r"\s+", " ", str(top.get("title", ""))).strip()
+        answer = tidy(res.get("answer", ""))
+        snippet = answer if persian_ratio(answer) >= 0.5 and len(answer) > 40 else tidy(str(top.get("content", "")))
+        title = tidy(str(top.get("title", "")))
         if persian_ratio(title + " " + snippet) >= 0.5:
             # هوش مصنوعی در دسترس نیست ولی خود منبع فارسی است: پیش‌نویس بدون هوش مصنوعی
             names = []
@@ -1358,6 +1429,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with get_lock():
             await send_post(context.bot, CHANNEL_ID, d)
+            if d.get("mark"):
+                await mark_seen(d["mark"])
         await context.bot.send_message(chat_id=q.message.chat_id, text="✅ در کانال گذاشته شد")
     except Exception as e:
         await context.bot.send_message(chat_id=q.message.chat_id, text=f"❌ ارسال نشد: {e}")
