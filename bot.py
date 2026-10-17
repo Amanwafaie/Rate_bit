@@ -600,6 +600,9 @@ PREFERRED = ["llama-3.3-70b", "gemma-3-27b", "qwen3", "qwen-2.5-72b", "deepseek"
              "mistral", "gpt-oss", "llama", "gemma"]
 
 
+FALLBACK_MODELS = ["meta-llama/llama-3.3-70b-instruct:free", "openai/gpt-oss-120b:free",
+                   "qwen/qwen3-next-80b-a3b-instruct:free", "google/gemma-3-27b-it:free",
+                   "mistralai/mistral-small-3.2-24b-instruct:free"]
 COOLDOWN = {}        # مدل -> تا چه زمانی استراحت کند
 BAD_MODELS = set()   # مدل‌هایی که خطای دائمی دادند
 
@@ -664,10 +667,17 @@ async def ai_call(prompt, admin=False, max_tokens=1200, budget=None, _retry=Fals
     deadline = time.time() + budget if budget else None
     try:
         async with make_client() as client:
-            models = await ai_models(client)
+            print("[ai] loading model list", flush=True)
+            try:
+                models = await asyncio.wait_for(ai_models(client), 20)
+            except Exception as e:
+                print(f"[ai] model list failed: {type(e).__name__} {e}", flush=True)
+                errs.append(f"model list: {type(e).__name__}")
+                models = [m for m in FALLBACK_MODELS if m not in BAD_MODELS]
             if not models:
                 AI["last_error"] = "no free model found"
                 return None
+            print(f"[ai] {len(models)} models: {', '.join(m.split('/')[-1] for m in models[:6])}", flush=True)
             tried = 0
             for model in models:
                 if model in BAD_MODELS or (not admin and COOLDOWN.get(model, 0) > time.time()):
@@ -681,14 +691,16 @@ async def ai_call(prompt, admin=False, max_tokens=1200, budget=None, _retry=Fals
                 AI["calls"] += 1
                 print(f"[ai] trying {model} (admin={admin})", flush=True)
                 try:
-                    r = await client.post(
+                    req_to = (min(35, max(8, deadline - time.time())) if deadline else 45)
+                    r = await asyncio.wait_for(client.post(
                         "https://openrouter.ai/api/v1/chat/completions",
                         headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
                                  "X-Title": "NabzKhabar"},
                         json={"model": model, "temperature": 0.3, "max_tokens": max_tokens,
                               "messages": [{"role": "user", "content": prompt}]},
-                        timeout=(min(35, max(8, deadline - time.time())) if deadline else 45),
-                    )
+                        timeout=req_to,
+                    ), timeout=req_to + 5)
+                    print(f"[ai] {model} -> HTTP {r.status_code}", flush=True)
                     if r.status_code != 200:
                         short_name = model.split("/")[-1]
                         errs.append(f"{short_name}: HTTP {r.status_code}" +
