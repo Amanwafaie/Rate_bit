@@ -688,7 +688,7 @@ async def groq_models(client):
     return [m for m in ids if m not in GROQ["bad"]]
 
 
-async def groq_call(prompt, max_tokens, errs):
+async def groq_call(prompt, max_tokens, errs, validate=None):
     """ارائه‌ی دهنده‌ی دوم (Groq)، فقط اگر کلیدش در Render گذاشته شده باشد."""
     if not GROQ_API_KEY:
         return None
@@ -717,7 +717,7 @@ async def groq_call(prompt, max_tokens, errs):
                         continue
                     content = (((r.json().get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
                     obj = extract_json(content)
-                    bad = check_obj(obj)
+                    bad = (validate or check_obj)(obj)
                     if bad:
                         errs.append(f"groq/{model}: {bad}")
                         continue
@@ -1126,6 +1126,8 @@ DOMAIN_NAMES = {
     "tolonews.com": "طلوع‌نیوز", "wikipedia.org": "Wikipedia", "theguardian.com": "Guardian",
     "apnews.com": "AP", "nytimes.com": "NYTimes", "aa.com.tr": "Anadolu", "usgs.gov": "USGS",
     "euronews.com": "یورونیوز", "independentpersian.com": "ایندیپندنت فارسی",
+    "cnbc.com": "CNBC", "fortune.com": "Fortune", "businessinsider.com": "Business Insider",
+    "wsj.com": "WSJ", "ft.com": "Financial Times",
 }
 
 
@@ -1145,7 +1147,87 @@ def clean_query(text):
     return re.sub(r"\s+", " ", q).strip() or text
 
 
-async def tavily_search(query, news=True, n=6):
+# منبع‌های بی‌اعتبار (شبکه‌ی اجتماعی و ویدئو) هیچ‌وقت در جواب نمی‌آیند
+BAD_DOMAINS = ("youtube.com", "youtu.be", "instagram.com", "facebook.com", "tiktok.com", "x.com",
+               "twitter.com", "pinterest.com", "reddit.com", "linkedin.com", "quora.com",
+               "aparat.com", "t.me", "telegram.me", "threads.net", "snapchat.com")
+# منبع‌های معتبر برای عدد و رتبه (ثروت، آمار)
+TRUST_DOMAINS = ("forbes.com", "bloomberg.com", "reuters.com", "cnbc.com", "fortune.com",
+                 "businessinsider.com", "wsj.com", "ft.com", "apnews.com", "bbc.com",
+                 "theguardian.com", "nytimes.com")
+FACT_WORDS = ("ثروت", "دارایی", "ثروتمند", "میلیاردر", "ارزش خالص", "ارزش بازار")
+
+
+def host_of(url):
+    return re.sub(r"^(www|m|amp)\.", "", urlsplit(url).netloc.lower())
+
+
+def domain_in(url, domains):
+    h = host_of(url)
+    return any(h == d or h.endswith("." + d) for d in domains)
+
+
+def finish(s):
+    """متن را به یک جمله‌ی کامل ختم می‌کند (نقطه‌چین و نیمه‌کاره حذف می‌شود)."""
+    s = str(s or "").strip()
+    s = re.sub(r"(…|\.\.\.)+\s*$", "", s).strip()
+    if not s or s[-1] in ".!؟?":
+        return s
+    ends = [m.end() for m in re.finditer(r"[.!؟](?=\s|$)", s)]
+    if ends and ends[-1] >= len(s) * 0.4:
+        return s[: ends[-1]]
+    return s + "."
+
+
+def cut_sentence(s, n):
+    """اگر طولانی بود، روی آخرین جمله‌ی کامل می‌برد، نه وسط جمله."""
+    s = s.strip()
+    if len(s) <= n:
+        return s
+    ends = [m.end() for m in re.finditer(r"[.!؟](?=\s|$)", s[:n])]
+    if ends:
+        return s[: ends[-1]]
+    return s[:n].rsplit(" ", 1)[0].rstrip("،,;؛ ") + "."
+
+
+_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def num_tokens(s):
+    s = str(s).translate(_DIGITS).replace("٫", ".").replace("٬", ",")
+    out = set()
+    for m in re.findall(r"\d[\d,]*(?:\.\d+)?", s):
+        out.add(m.replace(",", "").rstrip("."))
+    return out
+
+
+def unverified_numbers(ai, res):
+    """عددهای متن نهایی که در متن منبع‌ها پیدا نمی‌شوند (برای هشدار به ادمین)."""
+    out_text = " ".join([str(ai.get("title_fa", "")), str(ai.get("summary_fa", "")),
+                         str(ai.get("analysis_fa", ""))] + [str(b) for b in (ai.get("bullets_fa") or [])])
+    src = " ".join([str(res.get("answer", ""))] + [f"{x.get('title', '')} {x.get('content', '')}"
+                                                  for x in res.get("results", [])])
+    have = num_tokens(src)
+    miss = sorted(n for n in num_tokens(out_text) if len(n.replace(".", "")) >= 2 and n not in have)
+    return miss[:6]
+
+
+async def translate_query(q):
+    """سؤال فارسی ← جمله‌ی کوتاه انگلیسی برای جست‌وجو در منبع‌های معتبر (فقط با Groq). نشد = ''."""
+    if not GROQ_API_KEY:
+        return ""
+    prompt = ('Translate this Persian search request into a short English web search query. '
+              'Write person and company names in their standard English spelling. '
+              'Return JSON only: {"q": "..."}\n\nRequest: ' + q[:300])
+    check = lambda o: "" if re.search(r"[A-Za-z]{3}", str(o.get("q", ""))) else "no query"
+    try:
+        obj = await asyncio.wait_for(groq_call(prompt, 120, [], validate=check), 40)
+    except Exception:
+        return ""
+    return str(obj.get("q", "")).strip()[:200] if obj else ""
+
+
+async def tavily_search(query, news=True, n=6, trusted=False):
     """نتیجه: {"results":[...], "images":[...]} یا None"""
     if not TAVILY_API_KEY:
         TAV["last_error"] = "TAVILY_API_KEY not set"
@@ -1159,17 +1241,34 @@ async def tavily_search(query, news=True, n=6):
             "include_answer": True}
     if news:
         body["days"] = 3
+    if trusted:
+        body["include_domains"] = list(TRUST_DOMAINS)
+        body["max_results"] = 8
+    else:
+        body["exclude_domains"] = list(BAD_DOMAINS)
     try:
         async with make_client() as client:
             r = await client.post("https://api.tavily.com/search",
                                   headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
                                   json=body, timeout=25)
-        TAV["calls"] += 1
+            TAV["calls"] += 1
+            if r.status_code == 400 and ("include_domains" in body or "exclude_domains" in body):
+                body.pop("include_domains", None)
+                body.pop("exclude_domains", None)
+                r = await client.post("https://api.tavily.com/search",
+                                      headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+                                      json=body, timeout=25)
+                TAV["calls"] += 1
         if r.status_code != 200:
             TAV["last_error"] = f"HTTP {r.status_code} {r.text[:120]}"
             return None
         j = r.json()
-        results = [x for x in (j.get("results") or []) if x.get("url") and x.get("content")]
+        results = [x for x in (j.get("results") or []) if x.get("url") and x.get("content")
+                   and not domain_in(x["url"], BAD_DOMAINS)]
+        non_wiki = [x for x in results if not domain_in(x["url"], ("wikipedia.org",))]
+        if len(non_wiki) >= 3:
+            results = non_wiki          # ویکی‌پدیا برای عدد و رتبه‌ی روز قابل اتکا نیست
+        results.sort(key=lambda x: 0 if domain_in(x["url"], TRUST_DOMAINS) else 1)
         images = []
         for im in (j.get("images") or []):
             u = im.get("url") if isinstance(im, dict) else im
@@ -1221,13 +1320,21 @@ async def compose_from_search(query, res):
         f"Today is {today}. The editor asked: \"{query}\"\n"
         "Using ONLY the search results below, return a JSON object with these keys:\n"
         '"title_fa": headline in natural Persian (max 100 characters),\n'
-        '"summary_fa": 3-5 sentence summary in Persian answering the request (max 480 characters),\n'
-        '"bullets_fa": array of 2-4 short Persian key facts or figures (each max 90 characters),\n'
+        '"summary_fa": 2-4 COMPLETE sentences in Persian answering the request (max 400 characters, '
+        'every sentence finished, never ending with "..."),\n'
+        '"bullets_fa": array of 2-4 short Persian key facts or figures (each a complete fact, max 90 characters),\n'
         '"analysis_fa": 1-2 cautious sentences of context or analysis in Persian (max 240 characters), or "",\n'
         '"note_fa": a short Persian warning for the editor if sources disagree, figures are old '
         '(mention their date) or unconfirmed, otherwise "",\n'
         '"entity_en": the main person or company as its English Wikipedia page title, or "",\n'
         '"sensitive": true if the story involves death, war, crime or disaster, else false.\n'
+        "Money, ranking and statistics requests: give ONE headline figure, taken from the NEWEST dated result of "
+        "the MOST reliable source (Forbes, Bloomberg, Reuters, AP, BBC or a major newspaper), and always write its "
+        "source name and month/year. The title must make one clear claim; never put a range that mixes different "
+        "sources or dates in the title. Ignore undated figures and figures older than 12 months (you may mention in "
+        "note_fa that they exist). Wikipedia, YouTube, social media and personal blogs are NOT proof of a figure. "
+        "State a rank (for example 'fourth richest') only if a result explicitly says it, and name that source; "
+        "otherwise say the rank is not confirmed. Such figures change daily, so say 'as of <month year>'.\n"
         "Rules: write every Persian field ONLY in Persian script, never mixing English words into Persian "
         "sentences (translate them; Latin letters only for well-known names). Never invent facts, numbers or quotes. If sources give different numbers, give the range and "
         "say which source said what. If the results do not answer the request, say that clearly in summary_fa. "
@@ -1240,9 +1347,10 @@ async def compose_from_search(query, res):
 def build_search_text(ai, names, credit=""):
     esc = lambda s: html.escape(s, quote=False)
     title = short(str(ai["title_fa"]).strip(), 110)
-    summary = str(ai["summary_fa"]).strip()
-    bullets = [short(str(b).strip(), 95) for b in (ai.get("bullets_fa") or []) if str(b).strip()][:4]
-    analysis = short(str(ai.get("analysis_fa") or "").strip(), 240)
+    summary = finish(ai["summary_fa"])
+    bullets = [finish(b) for b in (ai.get("bullets_fa") or []) if str(b).strip() and len(str(b).strip()) <= 120][:4]
+    bullets = [b.rstrip(".") for b in bullets]
+    analysis = cut_sentence(finish(ai.get("analysis_fa") or ""), 240)
     foot = "📌 منبع: " + "، ".join(esc(n) for n in names[:3])
     if credit:
         foot += f"\n🖼 {credit}"
@@ -1250,7 +1358,7 @@ def build_search_text(ai, names, credit=""):
         foot += f"\n📢 {CHANNEL_ID}"
 
     def assemble(sum_len, use_b, use_a):
-        blocks = [f"📰 <b>{esc(title)}</b>", esc(short(summary, sum_len))]
+        blocks = [f"📰 <b>{esc(title)}</b>", esc(cut_sentence(summary, sum_len))]
         if use_b and bullets:
             blocks.append("\n".join("▫️ " + esc(b) for b in bullets))
         if use_a and analysis:
@@ -1384,9 +1492,22 @@ async def smart_news(update, context, text):
             except Exception:
                 pass
             return
-    res = await tavily_search(query, news=news)
-    if news and (not res or len(res["results"]) < 2):
-        res = await tavily_search(query, news=False) or res
+    fact = any(w in text for w in FACT_WORDS)
+    res = None
+    if fact:
+        q_en = await translate_query(query)
+        print(f"[smart] fact route, english query: {q_en or '-'}", flush=True)
+        if q_en:
+            year = datetime.now(KABUL).year
+            res = await tavily_search(f"{q_en} {year}", news=False, trusted=True)
+            if not res or len(res["results"]) < 2:
+                res = await tavily_search(f"{q_en} {year}", news=False) or res
+        if not res or len(res["results"]) < 2:
+            res = await tavily_search(query, news=False) or res
+    else:
+        res = await tavily_search(query, news=news)
+        if news and (not res or len(res["results"]) < 2):
+            res = await tavily_search(query, news=False) or res
     if not res or not res["results"]:
         await wait.edit_text("❌ نتیجه‌ای پیدا نشد.\nدلیل جست‌وجو: " + (TAV["last_error"] or "نتیجه‌ی خالی"))
         return
@@ -1440,9 +1561,13 @@ async def smart_news(update, context, text):
         n = src_name(x["url"])
         if n not in names:
             names.append(n)
+    note = short(str(ai.get("note_fa") or "").strip(), 300)
+    miss = unverified_numbers(ai, res)
+    if miss:
+        note = (note + "\n" if note else "") + "عددهایی که در متن منبع‌ها پیدا نشد (حتماً با لینک‌ها بررسی کن): " + "، ".join(miss)
     d = {
         "text": build_search_text(ai, names, credit), "parse": "HTML", "photo": photo,
-        "note": short(str(ai.get("note_fa") or "").strip(), 300),
+        "note": note,
         "sources": [{"name": src_name(x["url"]), "url": x["url"],
                      "date": str(x.get("published_date") or "")[:16]} for x in res["results"][:5]],
     }
@@ -1631,7 +1756,8 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if res:
         await update.message.reply_text(
             "✅ کار می‌کند\n\n" + str(res.get("title_fa")) + "\n" + str(res.get("summary_fa")) +
-            "\n\nارائه‌دهنده: " + (("Groq / " + GROQ["used"]) if GROQ["used"] and GROQ_API_KEY else "OpenRouter") + "\nمدل‌های OpenRouter: " + ", ".join(AI["models"][:3]) + f"\nمصرف امروز: {AI['calls']}/{AI_DAILY_LIMIT}")
+            "\n\nارائه‌دهنده: " + (("Groq / " + GROQ["used"]) if GROQ["used"] and GROQ_API_KEY else ("OpenRouter / " + ", ".join(AI["models"][:3])))
+            + (f"\nمصرف OpenRouter امروز: {AI['calls']}/{AI_DAILY_LIMIT}" if not (GROQ["used"] and GROQ_API_KEY) else ""))
     else:
         await update.message.reply_text("❌ کار نکرد\nدلیل: " + (AI["last_error"] or "-"))
 
