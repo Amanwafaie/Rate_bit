@@ -679,6 +679,7 @@ async def ai_call(prompt, admin=False, max_tokens=1200, budget=None, _retry=Fals
                     break
                 tried += 1
                 AI["calls"] += 1
+                print(f"[ai] trying {model} (admin={admin})", flush=True)
                 try:
                     r = await client.post(
                         "https://openrouter.ai/api/v1/chat/completions",
@@ -1188,6 +1189,7 @@ async def show_preview(update, context, d):
 
 
 async def smart_news(update, context, text):
+    print(f"[smart] start: {text[:60]}", flush=True)
     query = clean_query(text)
     news = any(w in text for w in NEWS_WORDS)
     wait = await update.message.reply_text("⏳ در حال جست‌وجو و آماده‌سازی...")
@@ -1197,11 +1199,13 @@ async def smart_news(update, context, text):
     if not res or not res["results"]:
         await wait.edit_text("❌ نتیجه‌ای پیدا نشد.\nدلیل جست‌وجو: " + (TAV["last_error"] or "نتیجه‌ی خالی"))
         return
+    print(f"[smart] search ok: {len(res['results'])} results", flush=True)
     try:
         await wait.edit_text(f"✅ {len(res['results'])} منبع پیدا شد.\n⏳ در حال نوشتن خبر (تا ۲ دقیقه)...")
     except Exception:
         pass
     ai = await compose_from_search(query, res)
+    print(f"[smart] ai done: {'ok' if ai else 'FAILED ' + (AI['last_error'] or '')[:200]}", flush=True)
     if not ai:
         top = res["results"][0]
         snippet = re.sub(r"\s+", " ", str(top.get("content", ""))).strip()
@@ -1307,7 +1311,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(HELP_TEXT)
         return
     try:
-        await asyncio.wait_for(smart_news(update, context, text), timeout=170)
+        await asyncio.wait_for(smart_news(update, context, text), timeout=150)
     except asyncio.TimeoutError:
         await msg.reply_text("❌ زمان تمام شد (سرویس‌ها کند بودند). چند دقیقه بعد دوباره بنویس.\nآخرین خطای هوش مصنوعی: " + (AI["last_error"] or "-")[:200])
     except Exception as e:
