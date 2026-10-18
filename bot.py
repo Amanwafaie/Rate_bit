@@ -1389,7 +1389,6 @@ async def breaking_job(context: ContextTypes.DEFAULT_TYPE):
                 BREAKING_TODAY["n"] += 1
                 return
 
-
 # =====================================================================
 #  دستیار هوشمند: چت خودمانی با ادمین (جست‌وجو ← پیش‌نمایش ← دکمه‌ی ارسال)
 # =====================================================================
@@ -2406,4 +2405,91 @@ async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             await update.message.reply_text("✅ خبر ارسال شد")
         else:
-            await update.message.reply_text("❌ خبری ارسال نشد.\nدلیل هوش مصنوعی: " + (AI["last_error"] o
+            await update.message.reply_text("❌ خبری ارسال نشد.\nدلیل هوش مصنوعی: " + (AI["last_error"] or "-") +
+                                            "\nبرای دیدن منبع‌ها /feeds را بزنید.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا: {e}")
+
+
+async def feeds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ در حال آزمایش منبع‌ها...")
+    lines = []
+    for src in SOURCES:
+        await get_items(src, force_refresh=True)
+        k = src["name"] + "|" + src["cat"]
+        st = SOURCE_STATUS.get(k, "؟")
+        inf = SOURCE_INFO.get(k)
+        extra = ""
+        if inf and inf["last_ok"]:
+            extra = " | آخرین موفق: " + datetime.fromtimestamp(inf["last_ok"], KABUL).strftime("%H:%M")
+        if inf and inf["fail"]:
+            extra += f" | خرابی پشت‌سرهم: {inf['fail']}"
+        lines.append(f"{CATS[src['cat']]['emoji']} {src['name']}: {st}{extra}")
+    lines.append("")
+    lines.append("🤖 هوش مصنوعی: " + ("کلید ثبت شده" if OPENROUTER_API_KEY else "کلید ندارد"))
+    lines.append("🔎 جست‌وجو: " + ("کلید ثبت شده" if TAVILY_API_KEY else "کلید ندارد"))
+    lines.append("🗄 پایگاه داده: " + ("Upstash فعال" if UPSTASH_URL and UPSTASH_TOKEN else "غیرفعال (حافظه‌ی موقت)"))
+    await update.message.reply_text("\n".join(lines))
+
+
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ آزمایش هوش مصنوعی...")
+    sample = {
+        "title": "Apple unveils new iPhone with faster chip",
+        "desc": "Apple on Tuesday announced a new iPhone model featuring a faster processor and improved camera, "
+                "saying it will go on sale next week.",
+    }
+    res = await ai_enrich(sample)
+    if res:
+        await update.message.reply_text(
+            "✅ کار می‌کند\n\n" + str(res.get("title_fa")) + "\n" + str(res.get("summary_fa")) +
+            "\n\nارائه‌دهنده: " + (("Groq / " + GROQ["used"]) if GROQ["used"] and GROQ_API_KEY else ("OpenRouter / " + ", ".join(AI["models"][:3])))
+            + (f"\nمصرف OpenRouter امروز: {AI['calls']}/{AI_DAILY_LIMIT}" if not (GROQ["used"] and GROQ_API_KEY) else ""))
+    else:
+        await update.message.reply_text("❌ کار نکرد\nدلیل: " + (AI["last_error"] or "-"))
+
+
+async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user and is_admin(user.id):
+        return
+    if not ADMINS and update.message and (update.message.text or "").startswith("/start"):
+        return
+    raise ApplicationHandlerStop
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Telegram error: {context.error}")
+
+
+def main():
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN is missing!")
+        return
+    if not ADMINS:
+        print("Warning: ADMIN_ID is empty, nobody can use commands.")
+    threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
+    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app.add_handler(TypeHandler(Update, guard), group=-1)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("postnow", postnow))
+    app.add_handler(CommandHandler("market", market_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("news", news_cmd))
+    app.add_handler(CommandHandler("feeds", feeds_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(send|cancel):"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, on_photo))
+    app.add_error_handler(on_error)
+    if app.job_queue:
+        app.job_queue.run_once(prime, when=3)
+        app.job_queue.run_repeating(tick, interval=20, first=15)
+        app.job_queue.run_repeating(breaking_job, interval=600, first=240)
+    print(f"Slots today: {len(SLOTS)}  | auto news per day: {NEWS_PER_DAY} | pair every {PAIR_EVERY_HOURS}h")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
