@@ -965,14 +965,32 @@ AFG_WORDS = ("افغان", "کابل", "طالبان", "هرات", "قندهار
              "تخار", "بلخ", "امارت اسلامی", "هزاره", "Afghan", "Taliban", "Kabul")
 
 
+_AFG_RX = [re.compile(r"(?<![\u0621-\u06CC\u200c])" + re.escape(w)) for w in AFG_WORDS]
+
+
+def afg_hits(text):
+    """چند واژه‌ی افغانستانی (از ابتدای واژه؛ «درخواست» دیگر «خوست» حساب نمی‌شود)."""
+    return sum(1 for rx in _AFG_RX if rx.search(text))
+
+
+def eff_cat(item):
+    """برچسب واقعی خبر از روی خود متن: افغانستان یا جهان (دسته‌های دیگر دست‌نخورده)."""
+    if item["cat"] not in ("afg", "world"):
+        return item["cat"]
+    if item["source"] == "آمو تی‌وی":
+        return "afg"
+    if afg_hits(item["title"]) >= 1 or afg_hits(item["title"] + " " + item["desc"]) >= 2:
+        return "afg"
+    return "world"
+
+
 def relevant(item):
     """خبر دسته‌ی افغانستان باید واقعاً به افغانستان ربط داشته باشد (فید بی‌بی‌سی گاهی خبرهای عمومی دارد)."""
     if "/live/" in item["link"]:
         return False                      # صفحه‌ی زنده‌ی در حال تغییر، خبر مستقل نیست
     if item["cat"] != "afg" or item["source"] == "آمو تی‌وی":
         return True
-    text = item["title"] + " " + item["desc"]
-    return any(w in text for w in AFG_WORDS)
+    return eff_cat(item) == "afg"
 
 
 async def candidates_for(cat, force=False):
@@ -998,7 +1016,7 @@ async def candidates_for(cat, force=False):
 
 
 def build_news_text(item, ai, credit=""):
-    c = CATS[item["cat"]]
+    c = CATS[eff_cat(item)]
     esc = lambda s: html.escape(s, quote=False)
     if ai:
         title = str(ai["title_fa"]).strip()
@@ -1566,6 +1584,35 @@ def find_sources(text):
     return domains, (cleaned or text)
 
 
+async def extract_full(res, n=2):
+    """برای درخواست «فهرست/ده نفر برتر»: متن کامل دو صفحه‌ی اول (ترجیحاً معتبر) را می‌خواند."""
+    if not TAVILY_API_KEY or TAV["calls"] > 950:
+        return
+    pick = [x for x in res["results"] if domain_in(x["url"], TRUST_DOMAINS)][:n] or res["results"][:n]
+    urls = [x["url"] for x in pick]
+    if not urls:
+        return
+    try:
+        async with make_client() as client:
+            r = await client.post("https://api.tavily.com/extract",
+                                  headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+                                  json={"urls": urls, "extract_depth": "basic"}, timeout=40)
+        TAV["calls"] += 1
+        if r.status_code != 200:
+            print(f"[smart] extract HTTP {r.status_code}", flush=True)
+            return
+        got = {x.get("url"): str(x.get("raw_content") or "") for x in (r.json().get("results") or [])}
+    except Exception as e:
+        print(f"[smart] extract error: {type(e).__name__}", flush=True)
+        return
+    for x in pick:
+        raw = re.sub(r"\s+", " ", got.get(x["url"], "")).strip()
+        if len(raw) > len(str(x.get("content", ""))) + 200:
+            x["content"] = raw[:6000]
+            x["long"] = True
+    print(f"[smart] extract ok: {sum(1 for x in pick if x.get('long'))} pages", flush=True)
+
+
 STABLE_DOMAINS = ("wikipedia.org", "britannica.com", "cia.gov", "worldometers.info", "un.org", "worldbank.org")
 
 
@@ -1618,7 +1665,10 @@ async def gather(text, q_hint="", plan=None):
     stable = bool(plan.get("stable"))
     parts = [p for p in (plan.get("parts") or []) if isinstance(p, str) and p.strip()][:3]
     if len(parts) < 2 or (TAV["calls"] > 900):
-        return await _gather_one(text, q_hint, stable)
+        r, d, q = await _gather_one(text, q_hint, stable)
+        if r and r.get("results") and plan.get("list"):
+            await extract_full(r)
+        return r, d, q
     merged, seen, answers, images, domains, query = [], set(), [], [], [], ""
     for part in parts:
         r, domains, query = await _gather_one(text, part, stable, lean=True)
@@ -1642,7 +1692,7 @@ def blocks_for(res, k=6):
     out = []
     for i, x in enumerate(res["results"][:k], 1):
         out.append(f"[{i}] source: {src_name(x['url'])} | date: {x.get('published_date') or 'unknown'}\n"
-                   f"Title: {x.get('title', '')}\nText: {str(x.get('content', ''))[:800]}")
+                   f"Title: {x.get('title', '')}\nText: {str(x.get('content', ''))[:(3500 if x.get('long') else 800)]}")
     return "\n\n".join(out)
 
 
@@ -1809,6 +1859,23 @@ def is_access_q(text):
     return who and ans
 
 
+NAME_TEXT = ("اسم من «سرافی‌یار» است (آیدی: @SarafiYar_bot). دستیار هوشمند کانال «نبض خبر | افغانستان و جهان» هستم "
+             "و فقط به مدیر کانال جواب می‌دهم.")
+REVIEW_TEXT = ("من هنوز نمی‌توانم پست‌های منتشرشده‌ی کانال را خودم بازبینی کنم (به تاریخچه‌ی کانال دسترسی ندارم).\n"
+               "اگر پستی به نظرت اشتباه است، متنش را همین‌جا برایم بفرست یا بنویس کدام خبر/عدد اشتباه بود تا با جست‌وجو بررسی کنم.")
+
+
+def is_name_q(text):
+    t = text.replace("‌", " ")
+    return len(t) < 30 and any(w in t for w in ("اسم تو", "نام تو", "اسمت", "نامت", "اسم شما", "اسمتون"))
+
+
+def is_review_q(text):
+    t = text.replace("‌", " ")
+    return len(t) < 110 and "اشتباه" in t and any(w in t for w in ("کانال", "پست", "خبر")) and \
+        any(w in t for w in ("بررسی", "چک", "ببین"))
+
+
 def is_identity(text):
     t = text.replace("‌", " ")
     return len(t) < 45 and any(w in t for w in (
@@ -1963,8 +2030,9 @@ async def compose_from_search(query, res, stable=False):
         '(mention their date) or unconfirmed, otherwise "",\n'
         '"entity_en": the main person or company as its English Wikipedia page title, or "",\n'
         '"sensitive": true if the story involves death, war, crime or disaster, else false,\n'
-        '"answered": true ONLY if the search results really contain the main figures or facts that were asked for '
-        '(for every person/country asked about), false if the results do not answer the request,\n'
+        '"answered": true if the search results contain the main figures or facts asked for, at least for one of the '
+        'people/countries asked about (if only some are covered, still answer true and name the missing ones in '
+        'note_fa); false only if the results contain none of what was asked,\n'
         '"rank_evidence": array of short EXACT English quotes copied from the results that support every rank you '
         'state (for example "ranks fifth"); [] if you state no rank.\n'
         + ("This is a STABLE fact (it practically never changes): do not add an old-figure warning, round small "
@@ -2280,6 +2348,7 @@ async def classify(text):
               'or about the assistant itself; '
               '"stable": true if the answer is a fact that practically never changes (height of a building, '
               'area of a country, a historical date, who built something), false for anything that changes; '
+              '"list": true if the message asks for a ranked list or a top-N list (for example the top 10 richest people); '
               '"q": a short English web search query if needs_web is true, else ""; '
               '"parts": if the message asks about 2 or 3 different people, countries or companies, an array with '
               'one short English search query for EACH of them (include what is asked, e.g. '
@@ -2295,6 +2364,7 @@ async def classify(text):
     parts = obj.get("parts")
     obj["parts"] = [str(x).strip()[:150] for x in parts if str(x).strip()][:3] if isinstance(parts, list) else []
     obj["stable"] = obj.get("stable") is True
+    obj["list"] = obj.get("list") is True
     return obj
 
 
@@ -2412,6 +2482,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if is_about_bot(text):
         await msg.reply_text(BUILT_TEXT)
+        return
+    if is_name_q(text):
+        await msg.reply_text(NAME_TEXT)
+        return
+    if is_review_q(text):
+        await msg.reply_text(REVIEW_TEXT)
         return
     if is_greeting(text) or is_identity(text):
         await msg.reply_text(INTRO_TEXT)
