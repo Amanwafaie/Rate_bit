@@ -2464,9 +2464,54 @@ HELP_TEXT = (
     "• «خبر زلزله را از بی‌بی‌سی برای کانال آماده کن» ← پیش‌نمایش پست\n"
     "• «مهم‌ترین خبر امروز افغانستان» ← پیش‌نمایش پست\n"
     "• «تبلیغ: متن تبلیغ» (یا عکس همراه توضیح)\n"
-    "• «نرخ‌ها» ، «وضعیت» ، «سهم امروز چقدر مانده»\n\n"
+    "• «نرخ‌ها» ، «وضعیت» ، «سهم امروز چقدر مانده»\n"
+    "• «پیام دعوت» (یا /invite) ← متن دعوت با دکمه‌ی عضویت و ارسال برای دوستان\n\n"
     "هر چیزی برای کانال اول فقط برای خودت پیش‌نمایش می‌آید و با دکمه‌ی «ارسال به کانال» منتشر می‌شود."
 )
+
+
+# --- پیام دعوت (برای فرستادن به دوستان) ---
+INVITE_TEXT = (
+    "🌍 می‌خواهید از تازه‌ترین خبرهای افغانستان و جهان باخبر باشید؟\n\n"
+    "📊 نبض خبر | افغانستان و جهان هر روز تازه‌ترین خبرها را در بخش‌های مختلف برای شما منتشر می‌کند:\n"
+    "🇦🇫 اخبار افغانستان\n"
+    "🌍 اخبار مهم جهان\n"
+    "💰 اقتصاد و نرخ ارز\n"
+    "🤖 فناوری و هوش مصنوعی\n"
+    "⚽ اخبار ورزشی\n"
+    "✅ انواع خبرهای تازه، در یک کانال\n\n"
+    "📲 همین حالا به نبض خبر بپیوندید!\n"
+    "{link}\n"
+    "🆔 {handle}\n"
+    "_________\n"
+    "برای حمایت از ما، دکمه‌ی «ارسال برای دوستان» را بزنید و کانال را برای دوستانتان بفرستید 🙏\n"
+    "_________\n"
+    "📰 با نبض خبر؛ از همه چیز باخبر!"
+).replace("\\n", "\n")
+
+
+def invite_parts():
+    handle = CHANNEL_ID if (CHANNEL_ID and CHANNEL_ID.startswith("@")) else "@NabzKhabar24hr"
+    link = "https://t.me/" + handle[1:]
+    share = "https://t.me/share/url?url=" + link
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📲 عضویت در کانال", url=link)],
+        [InlineKeyboardButton("📤 ارسال برای دوستان", url=share)],
+    ])
+    return INVITE_TEXT.replace("{link}", "🔗 " + link).replace("{handle}", handle), kb
+
+
+def is_invite_q(text):
+    t = text.replace("‌", " ")
+    return len(t) < 60 and any(w in t for w in ("پیام دعوت", "متن دعوت", "تبلیغ کانال", "دعوت‌نامه", "دعوتنامه",
+                                                 "متن عضویت", "پیام عضویت", "دعوت دوستان", "برای دوستان بفرست"))
+
+
+async def invite_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = invite_parts()
+    await update.message.reply_text(text, reply_markup=kb, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await update.message.reply_text("☝️ این پیام را برای دوستانت «فوروارد» کن (دکمه‌ها همراهش می‌روند). "
+                                    "اگر بخواهی این را در خود کانال هم بگذارم، بنویس «تبلیغ: » و متن را بچسبان.")
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2476,6 +2521,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text in ("کمک", "راهنما", "help", "Help"):
         await msg.reply_text(HELP_TEXT)
+        return
+    if is_invite_q(text):
+        await invite_cmd(update, context)
         return
     if is_access_q(text):
         await msg.reply_text(ACCESS_TEXT)
@@ -2760,6 +2808,7 @@ def main():
     app.add_handler(CommandHandler("news", news_cmd))
     app.add_handler(CommandHandler("feeds", feeds_cmd))
     app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CommandHandler("invite", invite_cmd))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(send|cancel):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, on_photo))
